@@ -14,22 +14,21 @@ WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEM
 COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
 OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 
-#import "Starboard.h"
-#import "StubReturn.h"
-#import "Foundation/NSMutableArray.h"
-#import "Foundation/NSString.h"
-#import "Foundation/NSMutableDictionary.h"
-#import "Foundation/NSNumber.h"
-#import "Foundation/NSNotificationCenter.h"
-#import "Foundation/NSData.h"
-#import "Foundation/NSUserDefaults.h"
-#import "Foundation/NSThread.h"
+#import <Starboard.h>
+#import <StubReturn.h>
+#import <Foundation/NSMutableArray.h>
+#import <Foundation/NSString.h>
+#import <Foundation/NSMutableDictionary.h>
+#import <Foundation/NSNumber.h>
+#import <Foundation/NSNotificationCenter.h>
+#import <Foundation/NSData.h>
+#import <Foundation/NSUserDefaults.h>
+#import <Foundation/NSThread.h>
 #import "NSStringInternal.h"
-#import "LoggingNative.h"
-#import "ForFoundationOnly.h"
+#import <LoggingNative.h>
+#import <ForFoundationOnly.h>
 #import <CoreFoundation/CFPreferences.h>
-
-static const wchar_t* TAG = L"NSUserDefaults";
+#import <mutex>
 
 FOUNDATION_EXPORT NSString* const NSGlobalDomain = @"NSGlobalDomain";
 FOUNDATION_EXPORT NSString* const NSArgumentDomain = @"NSArgumentDomain";
@@ -47,6 +46,8 @@ FOUNDATION_EXPORT NSString* const NSShortMonthNameArray = @"NSShortMonthNameArra
 FOUNDATION_EXPORT NSString* const NSUserDefaultsDidChangeNotification = @"NSUserDefaultsDidChangeNotification";
 
 @implementation NSUserDefaults {
+    StrongId<NSMutableDictionary> _cacheDict;
+    std::mutex _cacheLock;
     StrongId<NSMutableDictionary> _registrationDict;
     StrongId<NSOperationQueue> _synchronizeQueue;
 }
@@ -57,15 +58,21 @@ FOUNDATION_EXPORT NSString* const NSUserDefaultsDidChangeNotification = @"NSUser
 - (instancetype)init {
     [super init];
 
+    _cacheDict = [NSMutableDictionary dictionary];
     _registrationDict = [NSMutableDictionary dictionary];
 
-    _synchronizeQueue = [NSOperationQueue new];
+    _synchronizeQueue.attach([NSOperationQueue new]);
     [_synchronizeQueue setMaxConcurrentOperationCount:1];
 
     [self setObject:[NSArray arrayWithObject:@"en"] forKey:@"AppleLanguages"];
     [self setObject:@"en_US" forKey:@"AppleLocale"];
 
     return self;
+}
+
+- (void)dealloc {
+    [_synchronizeQueue waitUntilAllOperationsAreFinished];
+    [super dealloc];
 }
 
 /**
@@ -85,6 +92,7 @@ FOUNDATION_EXPORT NSString* const NSUserDefaultsDidChangeNotification = @"NSUser
  @Status Interoperable
 */
 - (id)dictionaryRepresentation {
+    [_synchronizeQueue waitUntilAllOperationsAreFinished];
     _CFApplicationPreferences* preferences = _CFStandardApplicationPreferences(kCFPreferencesCurrentApplication);
     CFDictionaryRef dict = _CFApplicationPreferencesCopyRepresentation(preferences);
     return [(NSDictionary*)dict autorelease];
@@ -123,16 +131,35 @@ FOUNDATION_EXPORT NSString* const NSUserDefaultsDidChangeNotification = @"NSUser
  @Status Interoperable
 */
 - (BOOL)synchronize {
-    return CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+    _cacheLock.lock();
+    [_cacheDict enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL* stop) {
+        CFPreferencesSetAppValue(static_cast<CFStringRef>(key), obj, kCFPreferencesCurrentApplication);
+    }];
+
+    [_cacheDict removeAllObjects];
+    _cacheLock.unlock();
+
+    BOOL result = CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication);
+
+    return result;
 }
 
 /**
  @Status Interoperable
 */
 - (id)objectForKey:(NSString*)defaultName {
-    id obj = [(id)CFPreferencesCopyAppValue(static_cast<CFStringRef>(defaultName), kCFPreferencesCurrentApplication) autorelease];
+    // Check cache
+    _cacheLock.lock();
+    id obj = [_cacheDict objectForKey:defaultName];
+    _cacheLock.unlock();
 
     if (!obj) {
+        // Check stored app preferences
+        obj = [(id)CFPreferencesCopyAppValue(static_cast<CFStringRef>(defaultName), kCFPreferencesCurrentApplication) autorelease];
+    }
+
+    if (!obj) {
+        // Fallback to registered defaults
         obj = [_registrationDict objectForKey:defaultName];
     }
 
@@ -246,10 +273,14 @@ FOUNDATION_EXPORT NSString* const NSUserDefaultsDidChangeNotification = @"NSUser
 
     CFTypeRef valueCopy = CFAutorelease(CFPropertyListCreateDeepCopy(kCFAllocatorDefault, value, kCFPropertyListMutableContainersAndLeaves));
 
-    CFPreferencesSetAppValue(static_cast<CFStringRef>(key), valueCopy, kCFPreferencesCurrentApplication);
+    _cacheLock.lock();
+    [_cacheDict setObject:(id)valueCopy forKey:key];
+    _cacheLock.unlock();
 
     [[NSNotificationCenter defaultCenter] postNotificationName:NSUserDefaultsDidChangeNotification object:self];
 
+    // Up to 2 synchronize operations are allowed in the queue, so that if an existing operation has not been removed from the queue,
+    // we still get a synchronize after the CFPreferencesSetAppValue call. Any additional operations would result in an extra synchronize.
     if ([_synchronizeQueue operationCount] < 2) {
         [_synchronizeQueue addOperationWithBlock:^void(void) {
             [self synchronize];
@@ -348,6 +379,7 @@ FOUNDATION_EXPORT NSString* const NSUserDefaultsDidChangeNotification = @"NSUser
  @Status Interoperable
 */
 - (void)removeObjectForKey:(NSString*)key {
+    [_synchronizeQueue waitUntilAllOperationsAreFinished];
     CFPreferencesSetAppValue((CFStringRef)key, NULL, kCFPreferencesCurrentApplication);
 
     [[NSNotificationCenter defaultCenter] postNotificationName:NSUserDefaultsDidChangeNotification object:self];
